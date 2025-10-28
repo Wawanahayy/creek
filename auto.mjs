@@ -1,11 +1,7 @@
 #!/usr/bin/env node
-// auto.mjs — Orchestrator dengan AUTO-DETECT dari point.mjs
-// Fitur:
-// - DETECT_FROM_POINTS=1 → baca output point.mjs, hitung remaining tiap phase (swap/stake/unstake/deposit/faucet)
-// - Per repetition ada retry & per-success delay
-// - Tetap ada DELAY_AFTER_<PHASE> setelah phase selesai
-
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
@@ -32,7 +28,7 @@ const CMDS = {
 };
 
 const POINT_CMD = process.env.POINT_CMD || 'node point.mjs';
-const DETECT_FROM_POINTS = truthy(process.env.DETECT_FROM_POINTS ?? '1'); // default ON
+const DETECT_FROM_POINTS = truthy(process.env.DETECT_FROM_POINTS ?? '1');
 
 const DELAYS = {
   faucet:  num(process.env.DELAY_AFTER_FAUCET_MS, 3000),
@@ -51,13 +47,11 @@ function successDelayFor(ph){
   return num(process.env[envKey], GLOBAL_SUCCESS_DELAY_MS);
 }
 
-// Retry
-const RETRY_GLOBAL_MAX    = int(process.env.RETRY_MAX, 1); // 1 = no retry
+const RETRY_GLOBAL_MAX    = int(process.env.RETRY_MAX, 1);
 const RETRY_BACKOFF_MS    = int(process.env.RETRY_BACKOFF_MS, 3000);
-const RETRY_BACKOFF_MODE  = String(process.env.RETRY_BACKOFF_MODE || 'linear'); // linear|exponential
+const RETRY_BACKOFF_MODE  = String(process.env.RETRY_BACKOFF_MODE || 'linear');
 const RETRY_BACKOFF_MULT  = num(process.env.RETRY_BACKOFF_MULT, 1.8);
 
-// Timeout
 const TIMEOUTS = {
   faucet:  int(process.env.TIMEOUT_FAUCET_MS,  0),
   swap:    int(process.env.TIMEOUT_SWAP_MS,    0),
@@ -71,7 +65,7 @@ const TIMEOUTS = {
 
 const STOP_ON_FAIL = truthy(process.env.STOP_ON_FAIL);
 
-// Per-phase override retry (opsional), contoh: RETRY_PHASE_stake=3
+// Per-phase override retry
 const PER_PHASE_RETRY = {};
 for (const ph of Object.keys(CMDS)) {
   const key = `RETRY_PHASE_${ph}`;
@@ -84,14 +78,36 @@ function int(v, d=0){ const n = parseInt(v ?? '', 10); return Number.isFinite(n)
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function truthy(v){ return ['1','true','yes','y','on'].includes(String(v||'').toLowerCase()); }
 
+// === DAILY ENSURE ===
+const DAILY_ENSURE_TX = truthy(process.env.DAILY_ENSURE_TX);         
+const DAILY_MIN_TX    = int(process.env.DAILY_MIN_TX, 1);            
+const DAILY_PHASES    = (process.env.DAILY_PHASES || 'faucet,swap,stake,unstake,deposit')         
+  .split(',').map(s=>s.trim()).filter(Boolean);
+const STATE_FILE      = process.env.DAILY_STATE_FILE || path.join('.cache','auto-daily.json');
+
+function ensureDir(p){ fs.mkdirSync(path.dirname(p), { recursive:true }); }
+function todayJakarta(){
+  const s = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jakarta' }); 
+  return s.slice(0,10); 
+}
+function loadState(){
+  try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; }
+}
+function saveState(st){ ensureDir(STATE_FILE); fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2)); }
+function hasDailyDone(st, day, phase, addr='*'){
+  return !!st?.[day]?.[addr]?.[phase];
+}
+function markDailyDone(st, day, phase, addr='*'){
+  st[day] ??= {}; st[day][addr] ??= {}; st[day][addr][phase] = true; return st;
+}
+
+// === map badge key → phase ===
 function mapKeyToPhase(keyLower){
-  // contoh key: stake_xaum_3, swap_usdc_gusd_3, redeem/unstake, deposit_gr_3, mint_xaum_faucet
   if (keyLower.includes('swap')) return 'swap';
   if (keyLower.includes('unstake') || keyLower.includes('redeem')) return 'unstake';
   if (keyLower.includes('stake')) return 'stake';
   if (keyLower.includes('deposit')) return 'deposit';
   if (keyLower.includes('mint')) return 'faucet';
-  // referrals & lainnya kita abaikan
   return null;
 }
 
@@ -120,7 +136,6 @@ async function execCapture(cmd, timeoutMs=0){
       if (to) clearTimeout(to);
       if (killedByTimeout) return reject(new Error('timeout'));
       if (code === 0) return resolve(out || '');
-      // tetap kembalikan output agar bisa diparse, tapi tandai error
       resolve(out || err || '');
     });
   });
@@ -155,9 +170,7 @@ async function runCmd(cmd, timeoutMs=0){
   });
 }
 
-async function runOneAttempt(ph){
-  return runCmd(CMDS[ph], TIMEOUTS[ph] || 0);
-}
+async function runOneAttempt(ph){ return runCmd(CMDS[ph], TIMEOUTS[ph] || 0); }
 
 async function runWithRetries(ph, retryMax){
   let attempt = 0;
@@ -174,7 +187,6 @@ async function runWithRetries(ph, retryMax){
       errLast = e;
       log.warn(`[${ph}] attempt ${attempt} failed: ${e?.message || e}`);
       if (attempt >= Math.max(1, retryMax)) break;
-
       if (RETRY_BACKOFF_MODE === 'exponential') {
         await sleep(backoff);
         backoff = Math.ceil(backoff * (RETRY_BACKOFF_MULT > 1 ? RETRY_BACKOFF_MULT : 2));
@@ -188,9 +200,6 @@ async function runWithRetries(ph, retryMax){
 }
 
 async function detectTimesFromPoint(){
-  // Format yang diparse (contoh baris):
-  // [info]   • Stake XAUm ×3 [stake_xaum_3] 3/3 ✅ (+25)
-  // [info]   • Deposit GR Collateral ×3 [deposit_gr_3] 0/3
   const out = await execCapture(POINT_CMD, TIMEOUTS.point || 0);
   const lines = out.split(/\r?\n/);
 
@@ -203,20 +212,15 @@ async function detectTimesFromPoint(){
   for (const raw of lines) {
     const m = re.exec(raw);
     if (!m) continue;
-    // const title = m[1]; // "Stake XAUm ×3"
-    const key = m[2];     // "stake_xaum_3"
-    const a = Number(m[3]); // done
-    const b = Number(m[4]); // need
-
+    const key = m[2];
+    const a = Number(m[3]);
+    const b = Number(m[4]);
     const phase = mapKeyToPhase(String(key).toLowerCase());
     if (!phase) continue;
-
-    // Simpan progress tertinggi (kalau ada beberapa entri/varian)
     progMap[phase] = Math.max(progMap[phase], a);
     needMap[phase] = Math.max(needMap[phase], b);
   }
 
-  // hitung remaining
   for (const ph of Object.keys(timesMap)) {
     const remaining = Math.max(0, (needMap[ph] || 0) - (progMap[ph] || 0));
     timesMap[ph] = remaining;
@@ -268,26 +272,34 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
   // 1) Deteksi remaining dari point.mjs
   let timesDetected = null;
   if (DETECT_FROM_POINTS) {
-    try {
-      timesDetected = await detectTimesFromPoint();
-    } catch (e) {
-      log.warn('[detect] gagal membaca point.mjs:', e?.message || e);
-      timesDetected = null;
-    }
+    try { timesDetected = await detectTimesFromPoint(); }
+    catch (e) { log.warn('[detect] gagal membaca point.mjs:', e?.message || e); timesDetected = null; }
   }
 
   // 2) Tentukan target repetitions per phase
   const targetTimes = {};
+  const st = DAILY_ENSURE_TX ? loadState() : {};
+  const today = todayJakarta();
+  // (opsional) alamat untuk key state; kalau multi-account, bisa diisi dari ENV
+  const ADDR_KEY = process.env.STATE_ADDR_KEY || '*';
+
   for (const ph of PHASES_CFG) {
-    // jika borrow/repay/point tidak ada di detection, pakai 0 (kecuali kamu ingin paksa run point)
     let t = 0;
     if (timesDetected && ph in timesDetected) {
       t = timesDetected[ph] || 0;
     } else {
-      // fallback: pakai TIMES_<PH> env kalau ada, else 1
       const envKey = `TIMES_${ph.toUpperCase()}`;
       t = int(process.env[envKey], 1);
     }
+
+    // === DAILY ENSURE: jika phase masuk daftar & belum ada tx hari ini → paksa minimal DAILY_MIN_TX
+    if (DAILY_ENSURE_TX && DAILY_PHASES.includes(ph) && !hasDailyDone(st, today, ph, ADDR_KEY)) {
+      if (t < DAILY_MIN_TX) {
+        log.info(`[daily] enforce: ${ph} set to at least ${DAILY_MIN_TX} for ${today}`);
+        t = DAILY_MIN_TX;
+      }
+    }
+
     targetTimes[ph] = t;
   }
 
@@ -296,7 +308,7 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
 
   const results = [];
 
-  // 3) Run tiap phase sesuai remaining
+  // 3) Run tiap phase sesuai repsTarget
   for (const ph of PHASES_CFG) {
     const retryMax = PER_PHASE_RETRY[ph] ?? RETRY_GLOBAL_MAX;
     const successDelay = successDelayFor(ph);
@@ -304,6 +316,13 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
 
     const res = await runPhase(ph, repsTarget, successDelay, retryMax);
     results.push({ phase: ph, ...res });
+
+    // === DAILY ENSURE: bila ada minimal 1 sukses, tandai selesai hari ini
+    if (DAILY_ENSURE_TX && res.repsSuccess > 0 && DAILY_PHASES.includes(ph)) {
+      markDailyDone(st, today, ph, process.env.STATE_ADDR_KEY || '*');
+      saveState(st);
+      log.info(`[daily] marked done: ${ph} @ ${today}`);
+    }
 
     if (!res.ok) {
       log.warn(`SKIP: Phase "${ph}" failed (${res.repsSuccess}/${res.repsTarget}) → lanjut…`);
@@ -328,7 +347,6 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
   process.exit(0);
 });
 
-// ===== Summary =====
 function printSummary(results){
   const ok = results.filter(r => r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget})`);
   const fail = results.filter(r => !r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget}${r.error ? `, ${r.error.message || 'error'}`:''})`);

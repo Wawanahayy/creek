@@ -79,7 +79,7 @@ function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function truthy(v){ return ['1','true','yes','y','on'].includes(String(v||'').toLowerCase()); }
 
 // === DAILY ENSURE ===
-const DAILY_ENSURE_TX = truthy(process.env.DAILY_ENSURE_TX);         
+const DAILY_ENSURE_TX = truthy(process.env.DAILY_ENSURE_TX ?? '1');         
 const DAILY_MIN_TX    = int(process.env.DAILY_MIN_TX, 1);            
 const DAILY_PHASES    = (process.env.DAILY_PHASES || 'faucet,swap,stake,unstake,deposit')         
   .split(',').map(s=>s.trim()).filter(Boolean);

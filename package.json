@@ -1,0 +1,16 @@
+{
+  "dependencies": {
+    "@mysten/sui": "^1.43.1",
+    "axios": "^1.12.2",
+    "axios-cookiejar-support": "^6.0.4",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0",
+    "fast-csv": "^5.0.5",
+    "https-proxy-agent": "^7.0.6",
+    "node-fetch": "^3.3.2",
+    "p-limit": "^7.2.0",
+    "puppeteer": "^24.26.1",
+    "tough-cookie": "^5.1.2",
+    "viem": "^2.38.4"
+  }
+}

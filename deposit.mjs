@@ -1,31 +1,43 @@
 #!/usr/bin/env node
 // deposit.mjs — Deposit GR Collateral (percent / amount / ladder)
+// Patched: accept SUI_PRIVATE_KEY / PRIVATE_KEY / PRIVATE_KEY_HEX and SUI_FULLNODE / FULLNODE_URL.
+// Supports ed25519 & secp256k1, various key encodings, and both new/old Sui SDK execute APIs.
+
 import 'dotenv/config';
 import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 import { Transaction } from '@mysten/sui/transactions';
 import { fromHex } from '@mysten/sui/utils';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { Secp256k1Keypair } from '@mysten/sui/keypairs/secp256k1';
 
 // ---------- LOG ----------
+const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 const log = {
-  info: (...a) => console.log('[info]', ...a),
-  warn: (...a) => console.warn('[warn]', ...a),
+  info:  (...a) => console.log('[info]', ...a),
+  warn:  (...a) => console.warn('[warn]', ...a),
   error: (...a) => console.error('[error]', ...a),
+  debug: (...a) => { if (LOG_LEVEL.includes('debug')) console.log('[debug]', ...a); },
 };
 
 // ---------- ENV ----------
-const FULLNODE = process.env.FULLNODE_URL || getFullnodeUrl('testnet');
-const RAW_PK = (process.env.PRIVATE_KEY || process.env.PRIVATE_KEY_HEX || '').trim();
+const FULLNODE =
+  process.env.SUI_FULLNODE ||
+  process.env.FULLNODE_URL ||
+  getFullnodeUrl('testnet');
+
+const RAW_PK =
+  String(process.env.SUI_PRIVATE_KEY || process.env.PRIVATE_KEY || process.env.PRIVATE_KEY_HEX || '').trim();
+
 const SENDER_OVERRIDE = (process.env.SUI_ADDRESS || '').toLowerCase();
 
 const VERSION_ID = process.env.VERSION_ID || '0x13f4679d0ebd6fc721875af14ee380f45cde02f81d690809ac543901d66f6758';
 const MARKET_ID  = process.env.MARKET_ID  || '0x166dd68901d2cb47b55c7cfbb7182316f84114f9e12da9251fd4c4f338e37f5d';
 const GR_TYPE    = process.env.GR_TYPE    || '0x5504354cf3dcbaf64201989bc734e97c1d89bba5c7f01ff2704c43192cc2717c::coin_gr::COIN_GR';
 
-const GAS_BUDGET = BigInt(process.env.GAS_BUDGET || '100000000');   // 0.1 SUI
-const DUST       = BigInt(process.env.DUST || '1000000');           // 0.001 (dec=9)
-const MIN_DEPOSIT= BigInt(process.env.MIN_DEPOSIT || '1000000000'); // 1.0 (dec=9)
+const GAS_BUDGET = BigInt(process.env.GAS_BUDGET || '100000000');   // 0.1 SUI (dec=9)
+const DUST       = BigInt(process.env.DUST || '1000000');           // 0.001
+const MIN_DEPOSIT= BigInt(process.env.MIN_DEPOSIT || '1000000000'); // 1.0
 
 const MODE = (process.env.DEPOSIT_MODE || 'percent').toLowerCase(); // 'percent'|'amount'|'ladder'
 const PERCENT = Number(process.env.DEPOSIT_PERCENT || '50');        // 1..99
@@ -39,14 +51,30 @@ const BACKOFF_MS = Number(process.env.DEPOSIT_BACKOFF_MS || '1500');
 // ---------- HELPERS ----------
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-function keypairFromEnv(raw) {
-  if (!raw) throw new Error('PRIVATE_KEY kosong.');
-  if (raw.startsWith('suiprivkey')) {
-    const { secretKey } = decodeSuiPrivateKey(raw);
-    return Ed25519Keypair.fromSecretKey(secretKey);
+// Universal key parser (supports suiprivkey:, ed25519:, secp256k1:, 0x-hex, base64)
+function parsePrivKey(raw, schemeFromEnv = String(process.env.SUI_KEY_SCHEME || '').toLowerCase()) {
+  if (!raw) throw new Error('SUI_PRIVATE_KEY / PRIVATE_KEY kosong.');
+
+  // sui-format or prefixed format
+  if (raw.startsWith('suiprivkey') || raw.startsWith('ed25519:') || raw.startsWith('secp256k1:')) {
+    const { schema, secretKey } = decodeSuiPrivateKey(raw);
+    const s = String(schema).toLowerCase();
+    if (s === 'ed25519')   return { kp: Ed25519Keypair.fromSecretKey(secretKey),  scheme: 'ed25519' };
+    if (s === 'secp256k1') return { kp: Secp256k1Keypair.fromSecretKey(secretKey), scheme: 'secp256k1' };
+    throw new Error(`Skema kunci tidak didukung: ${schema}`);
   }
-  const hex = raw.replace(/^0x/i, '');
-  return Ed25519Keypair.fromSecretKey(fromHex(hex));
+
+  // raw hex or base64 seed
+  let bytes;
+  if (raw.startsWith('0x')) bytes = fromHex(raw);
+  else                      bytes = Buffer.from(raw, 'base64');
+
+  // Beberapa export menambahkan 0x00 prefix (33 bytes)
+  if (bytes.length === 33) bytes = bytes.subarray(1);
+  if (bytes.length !== 32) throw new Error(`Seed harus 32 byte, dapat ${bytes.length} byte`);
+
+  if (schemeFromEnv === 'secp256k1') return { kp: Secp256k1Keypair.fromSecretKey(bytes), scheme: 'secp256k1' };
+  return { kp: Ed25519Keypair.fromSeed(bytes), scheme: 'ed25519' };
 }
 
 async function getLargestCoinObj(client, owner, coinType) {
@@ -67,7 +95,7 @@ async function getTotalBalance(client, owner, coinType) {
 
 function pickAmount(balance) {
   const maxSpendable = balance > DUST ? (balance - DUST) : balance;
-  if (maxSpendable < MIN_DEPOSIT) throw new Error(`Saldo GR sangat kecil: ${balance} < MIN_DEPOSIT(${MIN_DEPOSIT}).`);
+  if (maxSpendable < MIN_DEPOSIT) throw new Error(`Saldo GR terlalu kecil: ${balance} < MIN_DEPOSIT(${MIN_DEPOSIT}).`);
   if (MODE === 'amount') {
     if (AMOUNT_ABS <= 0n) throw new Error('MODE=amount tapi DEPOSIT_AMOUNT tidak valid.');
     let a = AMOUNT_ABS;
@@ -82,6 +110,7 @@ function pickAmount(balance) {
     if (a > maxSpendable) a = maxSpendable;
     return a;
   }
+  // ladder
   for (const x of LADDER) if (x >= MIN_DEPOSIT && x <= maxSpendable) return x;
   return maxSpendable;
 }
@@ -95,14 +124,39 @@ async function checkShared(client, id) {
   return d.reference?.digest || d.digest;
 }
 
+async function execTxCompat(sui, kp, tx) {
+  const built = await tx.build({ client: sui, onlyTransactionKind: false });
+  // Dry run (opsional tapi informatif)
+  const sim = await sui.dryRunTransactionBlock({ transactionBlock: built });
+  if (sim.effects?.status?.status !== 'success') {
+    log.warn('[warn] dryRun status != success', JSON.stringify(sim.effects?.status || {}));
+  } else {
+    log.info('[info] dryRun status: success');
+  }
+
+  const opt = { showEffects: true, showEvents: true, showBalanceChanges: true };
+  if (typeof sui.signAndExecuteTransactionBlock === 'function') {
+    return await sui.signAndExecuteTransactionBlock({ signer: kp, transactionBlock: tx, options: opt, requestType: 'WaitForLocalExecution' });
+  }
+  if (typeof sui.signAndExecuteTransaction === 'function') {
+    return await sui.signAndExecuteTransaction({ signer: kp, transaction: tx, options: opt, requestType: 'WaitForLocalExecution' });
+  }
+  if (typeof kp.signTransactionBlock === 'function' && typeof sui.executeTransactionBlock === 'function') {
+    const sig = await kp.signTransactionBlock({ transactionBlock: built });
+    return await sui.executeTransactionBlock({ transactionBlock: built, signature: sig.signature, options: opt, requestType: 'WaitForLocalExecution' });
+  }
+  throw new Error('Tidak menemukan method eksekusi Sui SDK yang cocok');
+}
+
 // ---------- MAIN ----------
 (async () => {
+  const { kp, scheme } = parsePrivKey(RAW_PK);
   const client = new SuiClient({ url: FULLNODE });
-  const kp = keypairFromEnv(RAW_PK);
   const sender = SENDER_OVERRIDE || kp.getPublicKey().toSuiAddress();
 
   log.info('== DEPOSIT GR COLLATERAL ==');
   log.info('Fullnode :', FULLNODE);
+  log.info('Key type :', scheme);
   log.info('Address  :', sender);
   log.info('Version  :', VERSION_ID);
   log.info('Market   :', MARKET_ID);
@@ -138,6 +192,7 @@ async function checkShared(client, id) {
     if (amount < MIN_DEPOSIT) throw new Error(`Amount efektif < MIN_DEPOSIT (${amount} < ${MIN_DEPOSIT}).`);
 
     const tx = new Transaction();
+    tx.setSender(sender);
     tx.setGasBudget(Number(GAS_BUDGET));
 
     const version = tx.object(VERSION_ID);
@@ -165,21 +220,7 @@ async function checkShared(client, id) {
     });
 
     try {
-      const sim = await client.dryRunTransactionBlock({
-        transactionBlock: await tx.build({ client, onlyTransactionKind: false }),
-      });
-      if (sim.effects.status.status !== 'success') {
-        log.warn('[warn] dryRun status != success', JSON.stringify(sim.effects.status));
-      } else {
-        log.info('[info] dryRun status: success ');
-      }
-
-      const res = await client.signAndExecuteTransaction({
-        signer: kp,
-        transaction: tx,
-        requestType: 'WaitForLocalExecution',
-        options: { showEffects: true, showEvents: true, showBalanceChanges: true },
-      });
+      const res = await execTxCompat(client, kp, tx);
 
       const status = res.effects?.status?.status;
       const digest = res.digest || res.effects?.transactionDigest;

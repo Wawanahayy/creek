@@ -76,10 +76,58 @@ for (const ph of Object.keys(CMDS)) {
   if (process.env[key] !== undefined) PER_PHASE_RETRY[ph] = int(process.env[key], RETRY_GLOBAL_MAX);
 }
 
-// ACCOUNTS & PARALLELISM
-// ACCOUNTS env should be comma-separated account identifiers (address, label, or key)
-const ACCOUNTS = (process.env.ACCOUNTS || '').split(',').map(s=>s.trim()).filter(Boolean);
-const PARALLELISM = int(process.env.PARALLELISM, 1); // 1 = sequential, >1 = parallel workers
+// ===== ACCOUNTS & PARALLELISM (NEW) =====
+// Allow flexible ACCOUNT formats and inject PRIVATE_KEY / SUI_PRIVATE_KEY for child processes
+const PRIVATE_KEY_ENV_NAME = process.env.PRIVATE_KEY_ENV_NAME || 'PRIVATE_KEY';
+const SUI_PRIVATE_KEY_ENV_NAME = process.env.SUI_PRIVATE_KEY_ENV_NAME || 'SUI_PRIVATE_KEY';
+
+// Helper: parse one account token (item can be: id, id=key, id=/path, rawKey)
+function parseAccountToken(item, idx) {
+  const eq = item.indexOf('=');
+  if (eq === -1) {
+    const v = item;
+    const looksLikeKey = /^edpk[A-Za-z0-9]+$/.test(v) || /^[0-9a-f]{64,}$/i.test(v) || v.length > 40 || v.startsWith('suiprivkey');
+    if (looksLikeKey) return { id: `acct-${idx+1}`, key: v, keyFile: null };
+    return { id: v, key: null, keyFile: null };
+  }
+  const id = item.slice(0, eq).trim() || `acct-${idx+1}`;
+  const val = item.slice(eq + 1).trim();
+  if (!val) return { id, key: null, keyFile: null };
+  if (val.startsWith('/') || val.startsWith('./')) return { id, key: null, keyFile: val };
+  return { id, key: val, keyFile: null };
+}
+
+// Build ACCOUNTS array from either ACCOUNTS_FILE or ACCOUNTS env
+let ACCOUNTS = [];
+if (process.env.ACCOUNTS_FILE) {
+  try {
+    const raw = fs.readFileSync(process.env.ACCOUNTS_FILE, 'utf8')
+      .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    ACCOUNTS = raw.map((line, idx) => {
+      // allow lines like "id=key" or just key
+      return parseAccountToken(line, idx);
+    });
+  } catch (e) {
+    log.error(`Gagal baca ACCOUNTS_FILE="${process.env.ACCOUNTS_FILE}":`, e.message || e);
+    process.exit(1);
+  }
+} else {
+  const ACCOUNTS_RAW = (process.env.ACCOUNTS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  ACCOUNTS = ACCOUNTS_RAW.map((item, idx) => parseAccountToken(item, idx));
+}
+
+// Legacy: allow INPUT file containing keys (one per line) — if provided and ACCOUNTS empty, load it
+if (!ACCOUNTS.length && process.env.INPUT) {
+  try {
+    const raw = fs.readFileSync(process.env.INPUT, 'utf8')
+      .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (raw.length) ACCOUNTS = raw.map((line, idx) => parseAccountToken(line, idx));
+  } catch (e) {
+    // ignore if not present
+  }
+}
+
+const PARALLELISM = int(process.env.PARALLELISM, 1); // used only if no inline keys/files (else forced to 1)
 
 // ===== Utils =====
 function num(v, d=0){ const n = Number(v); return Number.isFinite(n) ? n : d; }
@@ -114,6 +162,7 @@ function mapKeyToPhase(keyLower){
   return null;
 }
 
+// ---- child execution helpers ----
 async function execCapture(cmd, timeoutMs=0, envOverrides={}){
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, { shell: true, env: Object.assign({}, process.env, envOverrides) });
@@ -144,7 +193,6 @@ async function execCapture(cmd, timeoutMs=0, envOverrides={}){
   });
 }
 
-// runCmd sekarang menerima envOverrides agar child process tahu "account"
 async function runCmd(cmd, timeoutMs=0, envOverrides = {}){
   return new Promise((resolve, reject) => {
     log.info('$', cmd);
@@ -204,7 +252,7 @@ async function runWithRetries(ph, retryMax, envOverrides = {}){
   return { ok: false, attempts: attempt, error: errLast };
 }
 
-async function detectTimesFromPoint(envOverrides={}){
+async function detectTimesFromPoint(envOverrides={}) {
   const out = await execCapture(POINT_CMD, TIMEOUTS.point || 0, envOverrides);
   const lines = out.split(/\r?\n/);
 
@@ -235,7 +283,7 @@ async function detectTimesFromPoint(envOverrides={}){
   return timesMap;
 }
 
-async function runPhase(ph, repsTarget, successDelay, retryMax, envOverrides={}){
+async function runPhase(ph, repsTarget, successDelay, retryMax, envOverrides={}) {
   if (!CMDS[ph]) {
     log.warn(`skip unknown phase: ${ph}`);
     return { ok: true, tries: 0, repsSuccess: 0, repsTarget: 0, error: null };
@@ -282,8 +330,9 @@ function printSummary(results){
   console.log('=====================\n');
 }
 
-// === per-account run ===
-async function runForAccount(accountAddr, globalDetectedTimes=null){
+// === per-account run (UPDATED to accept accountObj) ===
+async function runForAccount(accountObj, globalDetectedTimes=null){
+  const accountAddr = accountObj.id;
   log.info(`=== RUN ACCOUNT: ${accountAddr} ===`);
   const results = [];
   const st = DAILY_ENSURE_TX ? loadState() : {};
@@ -323,14 +372,31 @@ async function runForAccount(accountAddr, globalDetectedTimes=null){
   log.info(`[${accountAddr}] phases:`, PHASES_CFG.join(' -> '));
   log.info(`[${accountAddr}] target repetitions:`, JSON.stringify(targetTimes));
 
-  // 3) Run each phase for this account
+  // 3) prepare envOverrides base for this account
+  const baseEnvOverrides = { ACCOUNT_ADDR: accountAddr, STATE_ADDR_KEY: accountAddr };
+
+  // inject private key if provided inline
+  if (accountObj.key) {
+    baseEnvOverrides[PRIVATE_KEY_ENV_NAME] = accountObj.key;
+    if (PRIVATE_KEY_ENV_NAME !== SUI_PRIVATE_KEY_ENV_NAME) baseEnvOverrides[SUI_PRIVATE_KEY_ENV_NAME] = accountObj.key;
+  } else if (accountObj.keyFile) {
+    try {
+      const keyContent = fs.readFileSync(accountObj.keyFile, 'utf8').trim();
+      baseEnvOverrides[PRIVATE_KEY_ENV_NAME] = keyContent;
+      if (PRIVATE_KEY_ENV_NAME !== SUI_PRIVATE_KEY_ENV_NAME) baseEnvOverrides[SUI_PRIVATE_KEY_ENV_NAME] = keyContent;
+    } catch (e) {
+      log.warn(`[${accountAddr}] gagal baca keyfile ${accountObj.keyFile}:`, e?.message || e);
+    }
+  }
+
+  // 4) Run each phase for this account (sequential)
   for (const ph of PHASES_CFG) {
     const retryMax = PER_PHASE_RETRY[ph] ?? RETRY_GLOBAL_MAX;
     const successDelay = successDelayFor(ph);
     const repsTarget = targetTimes[ph] ?? 0;
 
-    // env overrides for child commands so they know which account to operate on
-    const envOverrides = { ACCOUNT_ADDR: accountAddr, STATE_ADDR_KEY: accountAddr };
+    // clone base env overrides so we can add per-phase extras later if perlu
+    const envOverrides = Object.assign({}, baseEnvOverrides);
 
     const res = await runPhase(ph, repsTarget, successDelay, retryMax, envOverrides);
     results.push({ phase: ph, ...res });
@@ -361,7 +427,7 @@ async function runForAccount(accountAddr, globalDetectedTimes=null){
   return results;
 }
 
-// concurrency worker runner
+// concurrency worker runner (UPDATED to handle account objects and force sequential when keys present)
 async function runAllAccounts(accounts){
   // detect once globally (without ACCOUNT) to speed things up if desired
   let globalDetectedTimes = null;
@@ -372,13 +438,16 @@ async function runAllAccounts(accounts){
 
   if (!accounts.length) {
     // no accounts provided: run once using default env (like original behaviour)
-    await runForAccount(process.env.STATE_ADDR_KEY || '*', globalDetectedTimes);
+    await runForAccount({ id: process.env.STATE_ADDR_KEY || '*', key: null }, globalDetectedTimes);
     return;
   }
 
+  // if any account provides a private key (inline or file), force sequential mode (safe)
+  const hasKeys = accounts.some(a => a.key || a.keyFile);
+  const concurrency = hasKeys ? 1 : Math.max(1, PARALLELISM);
+
   const q = accounts.slice();
   const workers = [];
-  const concurrency = Math.max(1, PARALLELISM);
   for (let i=0;i<concurrency;i++){
     workers.push((async function worker(){
       while (true) {
@@ -390,7 +459,7 @@ async function runAllAccounts(accounts){
             log.error('Worker stopping due to STOP_ON_FAIL.');
             process.exit(1);
           }
-          log.error(`Account ${acc} fatal:`, e.message || e);
+          log.error(`Account ${acc.id} fatal:`, e.message || e);
         }
       }
     })());
@@ -403,7 +472,7 @@ async function runAllAccounts(accounts){
   try {
     log.info('Auto runner (multi-account aware) starting...');
     log.info('PHASES_CFG:', PHASES_CFG.join(','));
-    log.info('ACCOUNTS:', ACCOUNTS.length ? ACCOUNTS.join(',') : '(none)');
+    log.info('ACCOUNTS:', ACCOUNTS.length ? ACCOUNTS.map(a=>a.id).join(',') : '(none)');
     log.info('PARALLELISM:', PARALLELISM);
 
     await runAllAccounts(ACCOUNTS);

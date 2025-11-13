@@ -13,8 +13,8 @@ const GAS_BUDGET = process.env.GAS_BUDGET ? Number(process.env.GAS_BUDGET) : und
 const GAS_PRICE  = process.env.GAS_PRICE  ? Number(process.env.GAS_PRICE)  : undefined;
 
 // staking params
-const STAKE_MANAGER_ID = (process.env.STAKE_MANAGER_ID || '').trim(); // shared object
-const XAUM_COIN_TYPE   = (process.env.XAUM_COIN_TYPE   || '').trim(); // e.g. 0x...::coin_xaum::COIN_XAUM
+const STAKE_MANAGER_ID = (process.env.STAKE_MANAGER_ID || '0x5c9d26e8310f740353eac0e67c351f71bad8748cf5ac90305ffd32a5f3326990').trim(); // shared object
+const XAUM_COIN_TYPE   = (process.env.XAUM_COIN_TYPE   || '0xa03cb0b29e92c6fa9bfb7b9c57ffdba5e23810f20885b4390f724553d32efb8b::coin_xaum::COIN_XAUM').trim(); // e.g. 0x...::coin_xaum::COIN_XAUM
 const STAKE_AMOUNT     = process.env.STAKE_AMOUNT ? Number(process.env.STAKE_AMOUNT) : 1; // in XAUM
 const STAKE_AMOUNT_RAW = process.env.STAKE_AMOUNT_RAW ? BigInt(process.env.STAKE_AMOUNT_RAW) : null;
 

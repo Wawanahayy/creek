@@ -1,11 +1,7 @@
 #!/usr/bin/env node
-// auto.mjs — Orchestrator dengan AUTO-DETECT dari point.mjs
-// Fitur:
-// - DETECT_FROM_POINTS=1 → baca output point.mjs, hitung remaining tiap phase (swap/stake/unstake/deposit/faucet)
-// - Per repetition ada retry & per-success delay
-// - Tetap ada DELAY_AFTER_<PHASE> setelah phase selesai
-
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info').toLowerCase();
@@ -20,6 +16,7 @@ const DEFAULT_PHASES = 'faucet,swap,stake,unstake,deposit,point';
 const PHASES_CFG = (process.env.AUTO_PHASES || DEFAULT_PHASES)
   .split(',').map(s => s.trim()).filter(Boolean);
 
+// Add additional commands (wdsui, sui, reff) as requested
 const CMDS = {
   faucet:  process.env.FAUCET_CMD  || 'node faucet.mjs',
   swap:    process.env.SWAP_CMD    || 'node swap.mjs',
@@ -29,10 +26,13 @@ const CMDS = {
   borrow:  process.env.BORROW_CMD  || 'node borrow.mjs',
   repay:   process.env.REPAY_CMD   || 'node repay.mjs',
   point:   process.env.POINT_CMD   || 'node point.mjs',
+  wdsui:   process.env.WDSUI_CMD   || 'node wdsui.mjs',
+  sui:     process.env.SUI_CMD     || 'node sui.mjs',
+  reff:    process.env.REFF_CMD    || 'node reff.mjs',
 };
 
 const POINT_CMD = process.env.POINT_CMD || 'node point.mjs';
-const DETECT_FROM_POINTS = truthy(process.env.DETECT_FROM_POINTS ?? '1'); // default ON
+const DETECT_FROM_POINTS = truthy(process.env.DETECT_FROM_POINTS ?? '1');
 
 const DELAYS = {
   faucet:  num(process.env.DELAY_AFTER_FAUCET_MS, 3000),
@@ -51,13 +51,11 @@ function successDelayFor(ph){
   return num(process.env[envKey], GLOBAL_SUCCESS_DELAY_MS);
 }
 
-// Retry
-const RETRY_GLOBAL_MAX    = int(process.env.RETRY_MAX, 1); // 1 = no retry
+const RETRY_GLOBAL_MAX    = int(process.env.RETRY_MAX, 1);
 const RETRY_BACKOFF_MS    = int(process.env.RETRY_BACKOFF_MS, 3000);
-const RETRY_BACKOFF_MODE  = String(process.env.RETRY_BACKOFF_MODE || 'linear'); // linear|exponential
+const RETRY_BACKOFF_MODE  = String(process.env.RETRY_BACKOFF_MODE || 'linear');
 const RETRY_BACKOFF_MULT  = num(process.env.RETRY_BACKOFF_MULT, 1.8);
 
-// Timeout
 const TIMEOUTS = {
   faucet:  int(process.env.TIMEOUT_FAUCET_MS,  0),
   swap:    int(process.env.TIMEOUT_SWAP_MS,    0),
@@ -71,12 +69,17 @@ const TIMEOUTS = {
 
 const STOP_ON_FAIL = truthy(process.env.STOP_ON_FAIL);
 
-// Per-phase override retry (opsional), contoh: RETRY_PHASE_stake=3
+// Per-phase override retry
 const PER_PHASE_RETRY = {};
 for (const ph of Object.keys(CMDS)) {
   const key = `RETRY_PHASE_${ph}`;
   if (process.env[key] !== undefined) PER_PHASE_RETRY[ph] = int(process.env[key], RETRY_GLOBAL_MAX);
 }
+
+// ACCOUNTS & PARALLELISM
+// ACCOUNTS env should be comma-separated account identifiers (address, label, or key)
+const ACCOUNTS = (process.env.ACCOUNTS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const PARALLELISM = int(process.env.PARALLELISM, 1); // 1 = sequential, >1 = parallel workers
 
 // ===== Utils =====
 function num(v, d=0){ const n = Number(v); return Number.isFinite(n) ? n : d; }
@@ -84,20 +87,36 @@ function int(v, d=0){ const n = parseInt(v ?? '', 10); return Number.isFinite(n)
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 function truthy(v){ return ['1','true','yes','y','on'].includes(String(v||'').toLowerCase()); }
 
+// === DAILY ENSURE ===
+const DAILY_ENSURE_TX = truthy(process.env.DAILY_ENSURE_TX ?? '1');
+const DAILY_MIN_TX    = int(process.env.DAILY_MIN_TX, 1);
+const DAILY_PHASES    = (process.env.DAILY_PHASES || 'faucet,swap,stake,unstake')
+  .split(',').map(s=>s.trim()).filter(Boolean);
+const STATE_FILE      = process.env.DAILY_STATE_FILE || path.join('.cache','auto-daily.json');
+
+function ensureDir(p){ fs.mkdirSync(path.dirname(p), { recursive:true }); }
+function todayJakarta(){
+  const s = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Jakarta' });
+  return s.slice(0,10);
+}
+function loadState(){ try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
+function saveState(st){ ensureDir(STATE_FILE); fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2)); }
+function hasDailyDone(st, day, phase, addr='*'){ return !!st?.[day]?.[addr]?.[phase]; }
+function markDailyDone(st, day, phase, addr='*'){ st[day] ??= {}; st[day][addr] ??= {}; st[day][addr][phase] = true; return st; }
+
+// === map badge key → phase ===
 function mapKeyToPhase(keyLower){
-  // contoh key: stake_xaum_3, swap_usdc_gusd_3, redeem/unstake, deposit_gr_3, mint_xaum_faucet
   if (keyLower.includes('swap')) return 'swap';
   if (keyLower.includes('unstake') || keyLower.includes('redeem')) return 'unstake';
   if (keyLower.includes('stake')) return 'stake';
   if (keyLower.includes('deposit')) return 'deposit';
   if (keyLower.includes('mint')) return 'faucet';
-  // referrals & lainnya kita abaikan
   return null;
 }
 
-async function execCapture(cmd, timeoutMs=0){
+async function execCapture(cmd, timeoutMs=0, envOverrides={}){
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, { shell: true });
+    const p = spawn(cmd, { shell: true, env: Object.assign({}, process.env, envOverrides) });
     let out = '', err = '';
     let killedByTimeout = false;
     let to = null;
@@ -120,16 +139,17 @@ async function execCapture(cmd, timeoutMs=0){
       if (to) clearTimeout(to);
       if (killedByTimeout) return reject(new Error('timeout'));
       if (code === 0) return resolve(out || '');
-      // tetap kembalikan output agar bisa diparse, tapi tandai error
       resolve(out || err || '');
     });
   });
 }
 
-async function runCmd(cmd, timeoutMs=0){
+// runCmd sekarang menerima envOverrides agar child process tahu "account"
+async function runCmd(cmd, timeoutMs=0, envOverrides = {}){
   return new Promise((resolve, reject) => {
     log.info('$', cmd);
-    const p = spawn(cmd, { stdio: 'inherit', shell: true });
+    const env = Object.assign({}, process.env, envOverrides);
+    const p = spawn(cmd, { stdio: 'inherit', shell: true, env });
 
     let killedByTimeout = false;
     let to = null;
@@ -155,11 +175,9 @@ async function runCmd(cmd, timeoutMs=0){
   });
 }
 
-async function runOneAttempt(ph){
-  return runCmd(CMDS[ph], TIMEOUTS[ph] || 0);
-}
+async function runOneAttempt(ph, envOverrides={}){ return runCmd(CMDS[ph], TIMEOUTS[ph] || 0, envOverrides); }
 
-async function runWithRetries(ph, retryMax){
+async function runWithRetries(ph, retryMax, envOverrides = {}){
   let attempt = 0;
   let errLast = null;
   let backoff = RETRY_BACKOFF_MS;
@@ -168,13 +186,12 @@ async function runWithRetries(ph, retryMax){
     attempt++;
     try {
       log.debug(`[${ph}] attempt ${attempt}/${Math.max(1, retryMax)}`);
-      await runOneAttempt(ph);
+      await runOneAttempt(ph, envOverrides);
       return { ok: true, attempts: attempt, error: null };
     } catch (e) {
       errLast = e;
       log.warn(`[${ph}] attempt ${attempt} failed: ${e?.message || e}`);
       if (attempt >= Math.max(1, retryMax)) break;
-
       if (RETRY_BACKOFF_MODE === 'exponential') {
         await sleep(backoff);
         backoff = Math.ceil(backoff * (RETRY_BACKOFF_MULT > 1 ? RETRY_BACKOFF_MULT : 2));
@@ -187,11 +204,8 @@ async function runWithRetries(ph, retryMax){
   return { ok: false, attempts: attempt, error: errLast };
 }
 
-async function detectTimesFromPoint(){
-  // Format yang diparse (contoh baris):
-  // [info]   • Stake XAUm ×3 [stake_xaum_3] 3/3 ✅ (+25)
-  // [info]   • Deposit GR Collateral ×3 [deposit_gr_3] 0/3
-  const out = await execCapture(POINT_CMD, TIMEOUTS.point || 0);
+async function detectTimesFromPoint(envOverrides={}){
+  const out = await execCapture(POINT_CMD, TIMEOUTS.point || 0, envOverrides);
   const lines = out.split(/\r?\n/);
 
   const timesMap = { faucet:0, swap:0, stake:0, unstake:0, deposit:0 };
@@ -203,20 +217,15 @@ async function detectTimesFromPoint(){
   for (const raw of lines) {
     const m = re.exec(raw);
     if (!m) continue;
-    // const title = m[1]; // "Stake XAUm ×3"
-    const key = m[2];     // "stake_xaum_3"
-    const a = Number(m[3]); // done
-    const b = Number(m[4]); // need
-
+    const key = m[2];
+    const a = Number(m[3]);
+    const b = Number(m[4]);
     const phase = mapKeyToPhase(String(key).toLowerCase());
     if (!phase) continue;
-
-    // Simpan progress tertinggi (kalau ada beberapa entri/varian)
     progMap[phase] = Math.max(progMap[phase], a);
     needMap[phase] = Math.max(needMap[phase], b);
   }
 
-  // hitung remaining
   for (const ph of Object.keys(timesMap)) {
     const remaining = Math.max(0, (needMap[ph] || 0) - (progMap[ph] || 0));
     timesMap[ph] = remaining;
@@ -226,7 +235,7 @@ async function detectTimesFromPoint(){
   return timesMap;
 }
 
-async function runPhase(ph, repsTarget, successDelay, retryMax){
+async function runPhase(ph, repsTarget, successDelay, retryMax, envOverrides={}){
   if (!CMDS[ph]) {
     log.warn(`skip unknown phase: ${ph}`);
     return { ok: true, tries: 0, repsSuccess: 0, repsTarget: 0, error: null };
@@ -246,7 +255,7 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
     repsTried++;
     log.info(`[${ph}] repetition ${repsSuccess + 1}/${repsTarget}`);
 
-    const res = await runWithRetries(ph, retryMax);
+    const res = await runWithRetries(ph, retryMax, envOverrides);
     if (res.ok) {
       repsSuccess++;
       if (repsSuccess < repsTarget && successDelay > 0) {
@@ -264,53 +273,80 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
   return { ok: phaseOk, tries: repsTried, repsSuccess, repsTarget, error: phaseOk ? null : lastErr };
 }
 
-(async () => {
-  // 1) Deteksi remaining dari point.mjs
+function printSummary(results){
+  const ok = results.filter(r => r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget})`);
+  const fail = results.filter(r => !r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget}${r.error ? `, ${r.error.message || 'error'}`:''})`);
+  console.log('\n====== SUMMARY ======');
+  console.log('Sukses :', ok.length ? ok.join(', ') : '-');
+  console.log('Gagal  :', fail.length ? fail.join(', ') : '-');
+  console.log('=====================\n');
+}
+
+// === per-account run ===
+async function runForAccount(accountAddr, globalDetectedTimes=null){
+  log.info(`=== RUN ACCOUNT: ${accountAddr} ===`);
+  const results = [];
+  const st = DAILY_ENSURE_TX ? loadState() : {};
+  const today = todayJakarta();
+  const ADDR_KEY = accountAddr;
+
+  // 1) optionally detect per-account times from point.mjs using ACCOUNT in env
   let timesDetected = null;
   if (DETECT_FROM_POINTS) {
-    try {
-      timesDetected = await detectTimesFromPoint();
-    } catch (e) {
-      log.warn('[detect] gagal membaca point.mjs:', e?.message || e);
-      timesDetected = null;
-    }
+    try { timesDetected = await detectTimesFromPoint({ ACCOUNT_ADDR: accountAddr }); }
+    catch (e) { log.warn(`[detect ${accountAddr}] gagal membaca point.mjs:`, e?.message || e); timesDetected = null; }
   }
+  // fallback to global detection if provided
+  if (!timesDetected) timesDetected = globalDetectedTimes || null;
 
-  // 2) Tentukan target repetitions per phase
+  // 2) determine target repetitions per phase (same logic as original)
   const targetTimes = {};
   for (const ph of PHASES_CFG) {
-    // jika borrow/repay/point tidak ada di detection, pakai 0 (kecuali kamu ingin paksa run point)
     let t = 0;
     if (timesDetected && ph in timesDetected) {
       t = timesDetected[ph] || 0;
     } else {
-      // fallback: pakai TIMES_<PH> env kalau ada, else 1
       const envKey = `TIMES_${ph.toUpperCase()}`;
       t = int(process.env[envKey], 1);
     }
+
+    if (DAILY_ENSURE_TX && DAILY_PHASES.includes(ph) && !hasDailyDone(st, today, ph, ADDR_KEY)) {
+      if (t < DAILY_MIN_TX) {
+        log.info(`[daily:${accountAddr}] enforce: ${ph} set to at least ${DAILY_MIN_TX} for ${today}`);
+        t = DAILY_MIN_TX;
+      }
+    }
+
     targetTimes[ph] = t;
   }
 
-  log.info('Auto runner — phases:', PHASES_CFG.join(' -> '));
-  log.info('Target repetitions:', JSON.stringify(targetTimes));
+  log.info(`[${accountAddr}] phases:`, PHASES_CFG.join(' -> '));
+  log.info(`[${accountAddr}] target repetitions:`, JSON.stringify(targetTimes));
 
-  const results = [];
-
-  // 3) Run tiap phase sesuai remaining
+  // 3) Run each phase for this account
   for (const ph of PHASES_CFG) {
     const retryMax = PER_PHASE_RETRY[ph] ?? RETRY_GLOBAL_MAX;
     const successDelay = successDelayFor(ph);
     const repsTarget = targetTimes[ph] ?? 0;
 
-    const res = await runPhase(ph, repsTarget, successDelay, retryMax);
+    // env overrides for child commands so they know which account to operate on
+    const envOverrides = { ACCOUNT_ADDR: accountAddr, STATE_ADDR_KEY: accountAddr };
+
+    const res = await runPhase(ph, repsTarget, successDelay, retryMax, envOverrides);
     results.push({ phase: ph, ...res });
 
+    if (DAILY_ENSURE_TX && res.repsSuccess > 0 && DAILY_PHASES.includes(ph)) {
+      markDailyDone(st, today, ph, accountAddr);
+      saveState(st);
+      log.info(`[daily:${accountAddr}] marked done: ${ph} @ ${today}`);
+    }
+
     if (!res.ok) {
-      log.warn(`SKIP: Phase "${ph}" failed (${res.repsSuccess}/${res.repsTarget}) → lanjut…`);
+      log.warn(`SKIP (${accountAddr}): Phase "${ph}" failed (${res.repsSuccess}/${res.repsTarget}) → lanjut…`);
       if (STOP_ON_FAIL) {
         log.error('STOP_ON_FAIL=1 → menghentikan run sekarang.');
         printSummary(results);
-        process.exit(1);
+        throw new Error('stop_on_fail');
       }
     }
 
@@ -322,18 +358,58 @@ async function runPhase(ph, repsTarget, successDelay, retryMax){
   }
 
   printSummary(results);
-  process.exit(0);
-})().catch(e => {
-  log.error('FATAL:', e.message);
-  process.exit(0);
-});
-
-// ===== Summary =====
-function printSummary(results){
-  const ok = results.filter(r => r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget})`);
-  const fail = results.filter(r => !r.ok).map(r => `${r.phase} (${r.repsSuccess}/${r.repsTarget}${r.error ? `, ${r.error.message || 'error'}`:''})`);
-  console.log('\n====== SUMMARY ======');
-  console.log('Sukses :', ok.length ? ok.join(', ') : '-');
-  console.log('Gagal  :', fail.length ? fail.join(', ') : '-');
-  console.log('=====================\n');
+  return results;
 }
+
+// concurrency worker runner
+async function runAllAccounts(accounts){
+  // detect once globally (without ACCOUNT) to speed things up if desired
+  let globalDetectedTimes = null;
+  if (DETECT_FROM_POINTS) {
+    try { globalDetectedTimes = await detectTimesFromPoint(); }
+    catch(e){ log.warn('[detect global] failed:', e?.message || e); globalDetectedTimes = null; }
+  }
+
+  if (!accounts.length) {
+    // no accounts provided: run once using default env (like original behaviour)
+    await runForAccount(process.env.STATE_ADDR_KEY || '*', globalDetectedTimes);
+    return;
+  }
+
+  const q = accounts.slice();
+  const workers = [];
+  const concurrency = Math.max(1, PARALLELISM);
+  for (let i=0;i<concurrency;i++){
+    workers.push((async function worker(){
+      while (true) {
+        const acc = q.shift();
+        if (!acc) break;
+        try { await runForAccount(acc, globalDetectedTimes); }
+        catch(e){
+          if (e?.message === 'stop_on_fail') {
+            log.error('Worker stopping due to STOP_ON_FAIL.');
+            process.exit(1);
+          }
+          log.error(`Account ${acc} fatal:`, e.message || e);
+        }
+      }
+    })());
+  }
+  await Promise.all(workers);
+}
+
+// Entrypoint
+(async () => {
+  try {
+    log.info('Auto runner (multi-account aware) starting...');
+    log.info('PHASES_CFG:', PHASES_CFG.join(','));
+    log.info('ACCOUNTS:', ACCOUNTS.length ? ACCOUNTS.join(',') : '(none)');
+    log.info('PARALLELISM:', PARALLELISM);
+
+    await runAllAccounts(ACCOUNTS);
+    process.exit(0);
+  } catch (e) {
+    log.error('FATAL:', e.message || e);
+    process.exit(1);
+  }
+})();

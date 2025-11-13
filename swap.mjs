@@ -11,10 +11,10 @@ const FULLNODE = process.env.SUI_FULLNODE || getFullnodeUrl('testnet');
 const MODE     = (process.env.SWAP_MODE || 'execute').toLowerCase();  // execute|dryrun
 const LOG_LEVEL= String(process.env.LOG_LEVEL || 'info').toLowerCase();
 
-const USDC_TYPE = process.env.USDC_COIN_TYPE || '';
-const VAULT_ID  = process.env.VAULT_ID || '';
-const MARKET_ID = process.env.MARKET_ID || '';
-const CLOCK_ID  = process.env.CLOCK_ID || '0x6';
+const USDC_TYPE = process.env.USDC_COIN_TYPE || '0xa03cb0b29e92c6fa9bfb7b9c57ffdba5e23810f20885b4390f724553d32efb8b::usdc::USDC';
+const VAULT_ID  = process.env.VAULT_ID || '0x1fc1b07f7c1d06d4d8f0b1d0a2977418ad71df0d531c476273a2143dfeffba0e';
+const MARKET_ID = process.env.MARKET_ID || '0x166dd68901d2cb47b55c7cfbb7182316f84114f9e12da9251fd4c4f338e37f5d';
+const CLOCK_ID  = process.env.CLOCK_ID || '0x0000000000000000000000000000000000000000000000000000000000000006';
 
 const AMOUNT_RAW_ENV = process.env.SWAP_USDC_AMOUNT_RAW;
 const AMOUNT_DEC_ENV = process.env.SWAP_USDC_AMOUNT; // desimal USDC

@@ -12,7 +12,7 @@ import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 
 const FULLNODE     = process.env.SUI_FULLNODE || getFullnodeUrl('testnet');
 const MODE         = (process.env.MODE || 'execute').toLowerCase();    // 'execute' | 'dryrun'
-const CLAIM_MODE   = (process.env.CLAIM_MODE || 'usdc').toLowerCase(); // 'usdc' | 'xaum' | 'both' | 'alternate'
+const CLAIM_MODE   = (process.env.CLAIM_MODE || 'both').toLowerCase(); // 'usdc' | 'xaum' | 'both' | 'alternate'
 const GAS_BUDGET   = process.env.GAS_BUDGET ? Number(process.env.GAS_BUDGET) : null;
 const GAS_PRICE    = process.env.GAS_PRICE  ? Number(process.env.GAS_PRICE)  : null;
 const CLAIM_DELAY  = Number(process.env.CLAIM_DELAY_MS || '3000');     // delay antar-claim (ms), default 3s
@@ -181,8 +181,8 @@ function getCoinCfg(label) {
   const upper = label.toUpperCase(); // USDC | XAUM
   const cfg = {
     label,
-    pkg:       (process.env[`${upper}_PKG_ID`]        || '').trim(),
-    module:    (process.env[`${upper}_MODULE`]        || '').trim(),
+    pkg:       (process.env[`${upper}_PKG_ID`]        || '0xa03cb0b29e92c6fa9bfb7b9c57ffdba5e23810f20885b4390f724553d32efb8b').trim(),
+    module:    (process.env[`${upper}_MODULE`]        || 'USDC').trim(),
     func:      (process.env[`${upper}_FUNCTION`]      || 'mint').trim(),
     treas:     (process.env[`${upper}_TREASURY_ID`]   || '').trim(),
     coinType:  (process.env[`${upper}_COIN_TYPE`]     || '').trim(),

@@ -1,28 +1,191 @@
 #!/usr/bin/env node
 /**
- * gen_suikeys.mjs — generate Ed25519 Sui keys → "suiprivkey1..."
+ * gen_suikeys.mjs — derive Sui Ed25519 keys + optional AES-GCM encryption for outputs
  *
- * Kompatibel lintas versi @mysten/sui:
- * - Ambil seed 32B dari keypair (via export() jika ada, fallback slice 32B pertama)
- * - Coba encodeSuiPrivateKey dengan beberapa bentuk (seed32 / sk64, dgn/ tanpa schema)
+ * Usage:
+ *   node gen_suikeys.mjs                        # default -> 1 mnemonic × 10 keys
+ *   node gen_suikeys.mjs default 2 10           # generate 2 mnemonics × 10 keys
+ *   node gen_suikeys.mjs phrase "<mnemonic>" 10
+ *   node gen_suikeys.mjs --encrypt              # prompt passphrase to encrypt outputs
+ *   ENC_PASSPHRASE="pass" node gen_suikeys.mjs --encrypt
  *
- * Pakai:
- *   npm i @mysten/sui
- *   COUNT=10 OUT=./sui_keys.txt MAP=./keys_map.csv node gen_suikeys.mjs
+ * Install:
+ *   npm i @mysten/sui bip39 ed25519-hd-key tweetnacl @noble/hashes
+ *
+ * Outputs:
+ *   - privatekeys.txt   (plaintext or JSON-encrypted depending on --encrypt)
+ *   - mnemonics.txt     (plaintext or JSON-encrypted depending on --encrypt)
+ *   - map.csv           (always plaintext CSV mapping)
+ *
+ * Security:
+ *   - If you use --encrypt, passphrase is required to decrypt outputs later.
+ *   - Keep passphrase safe; lost passphrase => lost keys.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import readline from 'node:readline';
+import bip39 from 'bip39';
 import { encodeSuiPrivateKey } from '@mysten/sui/cryptography';
+import { derivePath } from 'ed25519-hd-key';
+import nacl from 'tweetnacl';
+import { blake2b } from '@noble/hashes/blake2b';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const COUNT = parseInt(process.env.COUNT || '10', 10);
-const OUT = process.env.OUT || path.resolve(__dirname, 'sui_keys.txt');
-const MAP = process.env.MAP || path.resolve(__dirname, 'keys_map.csv');
+const PRIVATE_OUT = path.resolve(process.cwd(), 'privatekeys.txt');
+const MNEMONIC_OUT = path.resolve(process.cwd(), 'mnemonics.txt');
+const MAP_OUT = path.resolve(process.cwd(), 'map.csv');
+
+const DEFAULT_PHRASES = 1;
+const DEFAULT_KEYS_PER_PHRASE = 10;
+
+/* --------------------------- encryption utils --------------------------- */
+
+function randBytes(n) {
+  return crypto.randomBytes(n);
+}
+function toB64(buf) {
+  return Buffer.from(buf).toString('base64');
+}
+function fromB64(s) {
+  return Buffer.from(s, 'base64');
+}
+
+/**
+ * Derive AES-256-GCM key from passphrase and salt using PBKDF2.
+ * iterations moderately high (200k).
+ */
+function deriveKeyFromPassphrase(passphrase, salt) {
+  return crypto.pbkdf2Sync(passphrase, salt, 200_000, 32, 'sha256'); // returns Buffer
+}
+
+/**
+ * Encrypt plaintext (string/Buffer) with passphrase.
+ * Returns JSON string with base64 fields: { salt, iv, ct }.
+ */
+function encryptWithPassphrase(passphrase, plaintext) {
+  const salt = randBytes(16);
+  const key = deriveKeyFromPassphrase(passphrase, salt);
+  const iv = randBytes(12); // 96-bit nonce for GCM
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ptBuf = Buffer.isBuffer(plaintext) ? plaintext : Buffer.from(String(plaintext), 'utf8');
+  const ct1 = Buffer.concat([cipher.update(ptBuf), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // store ct as ct||tag
+  const ctAll = Buffer.concat([ct1, tag]);
+  const obj = { salt: toB64(salt), iv: toB64(iv), ct: toB64(ctAll) };
+  return JSON.stringify(obj);
+}
+
+/**
+ * Decrypt JSON produced by encryptWithPassphrase using passphrase.
+ * Returns Buffer plaintext.
+ */
+function decryptWithPassphrase(passphrase, jsonStr) {
+  const obj = JSON.parse(jsonStr);
+  const salt = fromB64(obj.salt);
+  const iv = fromB64(obj.iv);
+  const ctAll = fromB64(obj.ct);
+  const key = deriveKeyFromPassphrase(passphrase, salt);
+  const tag = ctAll.slice(ctAll.length - 16);
+  const ct = ctAll.slice(0, ctAll.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+  return pt;
+}
+
+/* prompt passphrase silently (no echo) */
+function promptPassphrase(promptText = 'Passphrase: ') {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: true,
+    });
+    // hide input by muting output
+    const mutableStdout = rl.output;
+    const onDataHandler = (char) => {
+      char = char + '';
+      switch (char) {
+        case '\n':
+        case '\r':
+        case '\u0004':
+          mutableStdout.write('\n');
+          break;
+        default:
+          mutableStdout.write('*');
+          break;
+      }
+    };
+    process.stdin.on('data', onDataHandler);
+    rl.question(promptText, (answer) => {
+      process.stdin.removeListener('data', onDataHandler);
+      rl.close();
+      // ensure newline shown
+      process.stdout.write('\n');
+      resolve(answer);
+    });
+  });
+}
+
+/* --------------------------- crypto / sui utils --------------------------- */
+
+function bufHex(b) {
+  if (!b) return '';
+  if (Buffer.isBuffer(b)) return b.toString('hex');
+  if (b instanceof Uint8Array) return Buffer.from(b).toString('hex');
+  return String(b);
+}
+
+function encodeSuiprivkeyFromPriv32(priv32) {
+  const trials = [
+    () => encodeSuiPrivateKey({ schema: 'ED25519', secretKey: priv32 }),
+    () => encodeSuiPrivateKey(priv32),
+  ];
+  for (const t of trials) {
+    try {
+      const out = t();
+      if (typeof out === 'string' && out.startsWith('suiprivkey1')) return out;
+    } catch (_) {}
+  }
+  throw new Error('encodeSuiPrivateKey failed for priv32.');
+}
+
+function suiAddressFromPubkey(pubkeyBytes) {
+  const flag = new Uint8Array([0x00]); // Ed25519 flag
+  const input = new Uint8Array(flag.length + pubkeyBytes.length);
+  input.set(flag, 0);
+  input.set(pubkeyBytes, flag.length);
+  const hash = blake2b(input, { dkLen: 32 });
+  return '0x' + Buffer.from(hash).toString('hex');
+}
+
+function derivePriv32FromMnemonic(mnemonic, path) {
+  const seed = bip39.mnemonicToSeedSync(mnemonic); // Buffer
+  const derived = derivePath(path, seed);
+  return derived.key; // Buffer (32)
+}
+
+/* --------------------------- file helpers --------------------------- */
+
+function writePlainOrEncryptedFile(fp, contentStr, encrypt, passphrase) {
+  if (!encrypt) {
+    fs.appendFileSync(fp, contentStr);
+    return;
+  }
+  // if file doesn't exist, create empty then encrypt whole file? We'll append encrypted chunks as separate JSON lines.
+  // Approach: write each appended secret as its own JSON line (one encrypted object per secret) so we can append safely.
+  // contentStr should include trailing newline if desired.
+  const json = encryptWithPassphrase(passphrase, contentStr);
+  fs.appendFileSync(fp, json + '\n');
+}
+
+/* --------------------------- CSV helpers --------------------------- */
 
 function toCsvRow(arr) {
   return arr
@@ -34,87 +197,128 @@ function toCsvRow(arr) {
     })
     .join(',');
 }
-function writeCsv(fp, header, rows) {
-  const lines = [toCsvRow(header), ...rows.map(toCsvRow)];
-  fs.writeFileSync(fp, lines.join('\n'));
+function writeCsvHeaderIfMissing(fp, headerArr) {
+  if (!fs.existsSync(fp)) fs.writeFileSync(fp, toCsvRow(headerArr) + '\n');
+}
+function appendCsvRow(fp, arr) {
+  fs.appendFileSync(fp, toCsvRow(arr) + '\n');
 }
 
-/** Ambil seed 32B yang valid dari keypair (lintas versi) */
-function getSeed32FromKeypair(kp) {
-  // 1) Prefer export() kalau ada
-  if (typeof kp.export === 'function') {
-    try {
-      const exp = kp.export(); // { schema: 'ED25519', privateKey: <Uint8Array|Buffer|string> }
-      let priv = exp?.privateKey;
-      if (typeof priv === 'string') priv = Uint8Array.from(Buffer.from(priv, 'base64'));
-      if (priv && typeof priv.length === 'number') {
-        const u8 = priv instanceof Uint8Array ? priv : Uint8Array.from(priv);
-        if (u8.length === 32) return u8;
-      }
-    } catch (_) { /* fallback */ }
-  }
-  // 2) Fallback: getSecretKey() (64B sk||pk) → ambil 32B pertama
-  const sk = kp.getSecretKey(); // Uint8Array (biasanya 64)
-  const u8 = sk instanceof Uint8Array ? sk : Uint8Array.from(sk);
-  if (u8.length === 32) return u8;
-  if (u8.length >= 32) return u8.slice(0, 32);
-  throw new Error(`unexpected secret key length: ${u8.length}`);
+/* --------------------------- main derivation logic --------------------------- */
+
+const argv = process.argv.slice(2);
+// check for --encrypt flag
+const wantsEncrypt = argv.includes('--encrypt');
+// remove the flag from argv processed later
+const filteredArgs = argv.filter((a) => a !== '--encrypt');
+
+let mode = 'default';
+let arg1 = undefined;
+let arg2 = undefined;
+if (filteredArgs.length === 0) {
+  mode = 'default';
+} else {
+  mode = filteredArgs[0];
+  arg1 = filteredArgs[1];
+  arg2 = filteredArgs[2];
 }
 
-/** Beberapa strategi encoding → pilih pertama yang sukses & valid */
-function encodeSuiprivkeyRobust({ seed32, sk64 }) {
-  const trials = [
-    () => encodeSuiPrivateKey({ schema: 'ED25519', secretKey: seed32 }), // versi modern
-    () => encodeSuiPrivateKey({ schema: 'ED25519', secretKey: sk64 }),   // kalau versi lib minta 64B
-    () => encodeSuiPrivateKey(seed32),                                   // versi lama (tanpa schema)
-    () => encodeSuiPrivateKey(sk64),                                     // versi lama + 64B
-  ];
-  for (const t of trials) {
-    try {
-      const out = t();
-      if (typeof out === 'string' && out.startsWith('suiprivkey1')) return out;
-    } catch (_) {}
-  }
-  throw new Error('encodeSuiPrivateKey gagal untuk semua variasi (seed32 & sk64).');
-}
-
-async function main() {
-  // optional: tampilkan versi paket (kalau ada)
+(async () => {
   try {
-    const pkgUrl = pathToFileURL(
-      path.resolve(__dirname, 'node_modules/@mysten/sui/package.json')
-    ).href;
-    const mod = await import(pkgUrl);
-    console.log(`[info] @mysten/sui version: ${mod.default?.version || mod.version}`);
-  } catch {}
+    // prepare encryption passphrase if requested
+    let passphrase = process.env.ENC_PASSPHRASE || null;
+    if (wantsEncrypt && !passphrase) {
+      passphrase = await promptPassphrase('Enter encryption passphrase: ');
+      if (!passphrase) {
+        console.error('No passphrase provided. Aborting.');
+        process.exit(1);
+      }
+    }
 
-  const keyLines = [];
-  const mapRows = [];
+    const pathType = (process.env.PATH_TYPE || 'hardened').toLowerCase();
+    const PATH_TEMPLATE = pathType === 'nonhardened' ? "m/44'/784'/0'/0/{index}" : "m/44'/784'/0'/0'/{index}'";
 
-  for (let i = 0; i < COUNT; i++) {
-    const kp = Ed25519Keypair.generate();
-    const addr = kp.getPublicKey().toSuiAddress();
-    const sk64 = kp.getSecretKey();
-    const seed32 = getSeed32FromKeypair(kp);
+    // ensure map csv header
+    writeCsvHeaderIfMissing(MAP_OUT, ['mnemonic_index', 'mnemonic', 'index', 'path', 'address', 'pubkey_hex', 'private_key_hex', 'suiprivkey']);
 
-    if (seed32.length !== 32) throw new Error(`Seed bukan 32B (got ${seed32.length})`);
+    // prepare (create or truncate) output files if not exists
+    if (!fs.existsSync(PRIVATE_OUT)) fs.writeFileSync(PRIVATE_OUT, '');
+    if (!fs.existsSync(MNEMONIC_OUT)) fs.writeFileSync(MNEMONIC_OUT, '');
 
-    // Robust encode
-    const suiPriv = encodeSuiprivkeyRobust({ seed32, sk64 });
+    if (mode === 'phrase') {
+      if (!arg1 || !arg2) {
+        console.error('Usage: node gen_suikeys.mjs phrase "<mnemonic>" <count>');
+        process.exit(1);
+      }
+      const mnemonic = String(arg1).trim();
+      const count = parseInt(arg2, 10);
+      if (!bip39.validateMnemonic(mnemonic)) {
+        console.error('Error: provided mnemonic is invalid.');
+        process.exit(1);
+      }
 
-    keyLines.push(suiPriv);
-    mapRows.push([addr, suiPriv]);
+      // append mnemonic to mnemonics file (encrypted or plaintext)
+      const mnemonicLine = mnemonic + '\n';
+      writePlainOrEncryptedFile(MNEMONIC_OUT, mnemonicLine, wantsEncrypt, passphrase);
+
+      for (let i = 0; i < count; i++) {
+        const path = PATH_TEMPLATE.replace('{index}', String(i));
+        const priv32 = derivePriv32FromMnemonic(mnemonic, path); // Buffer
+        const kp = nacl.sign.keyPair.fromSeed(priv32);
+        const pub = kp.publicKey;
+        const address = suiAddressFromPubkey(pub);
+        const pubkey_hex = bufHex(pub);
+        const private_key_hex = bufHex(priv32);
+        const suiprivkey = encodeSuiprivkeyFromPriv32(priv32);
+
+        // write private key: either plaintext suiprivkey + newline, or encrypted JSON-line
+        writePlainOrEncryptedFile(PRIVATE_OUT, suiprivkey + '\n', wantsEncrypt, passphrase);
+
+        appendCsvRow(MAP_OUT, [-1, mnemonic, i, path, address, pubkey_hex, private_key_hex, suiprivkey]);
+      }
+
+      console.log(`✅ Derived ${count} keys from provided mnemonic. Files updated: ${PRIVATE_OUT}, ${MAP_OUT}, ${MNEMONIC_OUT}`);
+      process.exit(0);
+    }
+
+    // default mode: generate phrasesCount mnemonics; each produce keysPerPhrase keys
+    const phrasesCount = arg1 ? Math.max(1, parseInt(arg1, 10) || DEFAULT_PHRASES) : DEFAULT_PHRASES;
+    const keysPerPhrase = arg2 ? Math.max(1, parseInt(arg2, 10) || DEFAULT_KEYS_PER_PHRASE) : DEFAULT_KEYS_PER_PHRASE;
+
+    let total = 0;
+    for (let mIdx = 0; mIdx < phrasesCount; mIdx++) {
+      const mnemonic = bip39.generateMnemonic(256);
+      // store mnemonic (encrypted or not)
+      writePlainOrEncryptedFile(MNEMONIC_OUT, mnemonic + '\n', wantsEncrypt, passphrase);
+
+      for (let i = 0; i < keysPerPhrase; i++) {
+        const path = PATH_TEMPLATE.replace('{index}', String(i));
+        const priv32 = derivePriv32FromMnemonic(mnemonic, path); // Buffer
+        const kp = nacl.sign.keyPair.fromSeed(priv32);
+        const pub = kp.publicKey;
+        const address = suiAddressFromPubkey(pub);
+        const pubkey_hex = bufHex(pub);
+        const private_key_hex = bufHex(priv32);
+        const suiprivkey = encodeSuiprivkeyFromPriv32(priv32);
+
+        // write private key: plaintext suiprivkey (or encrypted json line)
+        writePlainOrEncryptedFile(PRIVATE_OUT, suiprivkey + '\n', wantsEncrypt, passphrase);
+
+        appendCsvRow(MAP_OUT, [mIdx, mnemonic, i, path, address, pubkey_hex, private_key_hex, suiprivkey]);
+        total++;
+      }
+      console.log(` - mnemonic #${mIdx} generated with ${keysPerPhrase} keys`);
+    }
+
+    console.log(`✅ Done. total keys generated: ${total}`);
+    console.log(`Files:`);
+    console.log(`  • private keys: ${PRIVATE_OUT} ${wantsEncrypt ? '(encrypted)' : ''}`);
+    console.log(`  • mnemonics   : ${MNEMONIC_OUT} ${wantsEncrypt ? '(encrypted)' : ''}`);
+    console.log(`  • mapping csv : ${MAP_OUT}`);
+    console.log('');
+    console.log('Security: If you used --encrypt, keep the passphrase safe. Losing it means losing access to the keys.');
+  } catch (e) {
+    console.error('❌ Error:', e);
+    process.exit(1);
   }
-
-  fs.writeFileSync(OUT, keyLines.join('\n') + '\n');
-  writeCsv(MAP, ['address', 'suiprivkey'], mapRows);
-
-  console.log(`✅ Generated ${COUNT} keys`);
-  console.log(`   • suiprivkey list : ${OUT}`);
-  console.log(`   • address mapping : ${MAP}`);
-}
-
-main().catch((e) => {
-  console.error('❌ gagal generate:', e);
-  process.exit(1);
-});
+})();

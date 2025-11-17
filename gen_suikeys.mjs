@@ -13,7 +13,7 @@
  *   npm i @mysten/sui bip39 ed25519-hd-key tweetnacl @noble/hashes
  *
  * Outputs:
- *   - privatekeys.txt   (plaintext or JSON-encrypted depending on --encrypt)
+ *   - privatekey.txt   (plaintext or JSON-encrypted depending on --encrypt)
  *   - mnemonics.txt     (plaintext or JSON-encrypted depending on --encrypt)
  *   - map.csv           (always plaintext CSV mapping)
  *
@@ -36,7 +36,7 @@ import { blake2b } from '@noble/hashes/blake2b';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PRIVATE_OUT = path.resolve(process.cwd(), 'privatekeys.txt');
+const PRIVATE_OUT = path.resolve(process.cwd(), 'privatekey.txt');
 const MNEMONIC_OUT = path.resolve(process.cwd(), 'mnemonics.txt');
 const MAP_OUT = path.resolve(process.cwd(), 'map.csv');
 

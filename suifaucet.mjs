@@ -1,13 +1,9 @@
 // sui-faucet-batch.mjs
 // Node ESM script
-// - Baca privatekey.txt (1 key per line, bech32 suiprivkey1...)
-// - Untuk tiap address: coba faucets sampai balance > 0 lalu lanjut ke next key
-// - Backoff exponential: 3s, 6s, 12s, ... max 10 menit
-// - Tidak mencetak private key ke log
-//
+
 // Usage:
 // 1) npm install @mysten/sui node-fetch bech32
-//    or if using node-fetch polyfill, the import below handles it.
+// 2) node sui-faucet-batch.mjs   (Node >=18 recommended)
 
 import fs from "fs/promises";
 import fetch from "node-fetch";
@@ -27,6 +23,8 @@ const faucetsToTry = [
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ========== Helpers key ==========
+
 function decodeSuiprivkey(bech32Str) {
   const { words } = bech32.decode(bech32Str);
   const bytes = bech32.fromWords(words);
@@ -35,14 +33,21 @@ function decodeSuiprivkey(bech32Str) {
 
 function keypairFromBech32PrivateKey(bech32Str) {
   const payload = decodeSuiprivkey(bech32Str);
-  if (payload.length < 33) throw new Error("decoded payload too short to contain flag + 32-byte seed");
+  if (payload.length < 33) {
+    throw new Error("decoded payload too short to contain flag + 32-byte seed");
+  }
   const seed = payload.slice(payload.length - 32);
   return Ed25519Keypair.fromSecretKey(seed);
 }
 
+// ========== Helpers chain ==========
+
 async function getBalanceForAddress(address) {
   try {
-    const coins = await client.getBalance({ owner: address, coinType: "0x2::sui::SUI" });
+    const coins = await client.getBalance({
+      owner: address,
+      coinType: "0x2::sui::SUI",
+    });
     return coins?.totalBalance ?? 0;
   } catch (e) {
     console.warn("Error fetching balance:", e?.message || e);
@@ -64,22 +69,34 @@ async function tryHttpFaucet(host, recipient) {
   return await res.json();
 }
 
-async function requestUntilSuccess(address) {
-  const minDelay = 3000;          // 1 detik
-  const maxDelay = 10000; // 1 
+
+async function requestUntilOneSuccess(address, timeLimitMs) {
+  const minDelay = 3000; // 3 detik
+  const maxDelay = 10000; // 10 detik
   let delay = minDelay;
 
-  console.log(`\n=== Starting requests for address: ${address} ===`);
+  const startedAt = Date.now();
 
-  let balance = await getBalanceForAddress(address);
-  console.log(`Initial balance: ${balance}`);
-  if (balance > 0) {
-    console.log("Already funded — skipping.");
-    return true;
+  console.log(`\n=== Starting faucet loop for address: ${address} ===`);
+  if (timeLimitMs) {
+    console.log(
+      `Time limit for this address: ${Math.round(timeLimitMs / 1000)} seconds`
+    );
+  } else {
+    console.log(`No time limit (will spam until 1 success).`);
   }
 
+  const initialBalance = await getBalanceForAddress(address);
+  console.log(`Initial balance: ${initialBalance}`);
+
   while (true) {
-    let success = false;
+    // cek time limit
+    if (timeLimitMs && Date.now() - startedAt > timeLimitMs) {
+      console.log(
+        `⏱️ Time limit reached for ${address}, moving to next address (no success yet).`
+      );
+      return false;
+    }
 
     for (const f of faucetsToTry) {
       try {
@@ -90,64 +107,113 @@ async function requestUntilSuccess(address) {
             ? await trySdkFaucet(f.host, address)
             : await tryHttpFaucet(f.host, address);
 
-        console.log("Faucet response:", JSON.stringify(result));
+        console.log(
+          "Faucet response:",
+          JSON.stringify(result).slice(0, 200),
+          "…"
+        );
 
+        // anggap ini sudah 1x "success" untuk hari ini
+        console.log(`✅ Faucet SUCCESS for ${address} via ${f.name}`);
+        // opsional: cek balance hanya untuk info
         await sleep(1500);
-        balance = await getBalanceForAddress(address);
-        console.log(`Balance after request: ${balance}`);
+        const balAfter = await getBalanceForAddress(address);
+        console.log(`Balance after success: ${balAfter}`);
 
-        if (balance > 0) {
-          console.log(`SUCCESS: ${address} funded!`);
-          return true;
-        }
+        return true; // 1 hari 1 sukses → cukup
       } catch (e) {
-        console.warn(`Faucet ${f.name} failed:`, e.message || e);
+        console.warn(`Faucet ${f.name} failed:`, e?.message || e);
       }
 
       await sleep(1000); // jeda antar faucet
     }
 
-    // jika semua faucet gagal → delay diperbesar
-    console.log(`All faucets failed. Waiting ${Math.round(delay / 1000)}s...`);
+    console.log(
+      `All faucets failed this round for ${address}. Waiting ${Math.round(
+        delay / 1000
+      )}s before next round...`
+    );
     await sleep(delay);
-
-    // tingkatkan delay
     delay = Math.min(delay * 2, maxDelay);
   }
 }
 
+// ========== main ==========
 
 async function main() {
   try {
     const raw = await fs.readFile(PRIVATE_KEY_FILE, "utf-8");
-    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const lines = raw
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
 
     if (lines.length === 0) {
       console.error("privatekey.txt kosong atau tidak ditemukan key.");
       process.exit(1);
     }
 
+    // derive semua address dulu
+    const addresses = [];
     for (const line of lines) {
       if (!line.toLowerCase().startsWith("suiprivkey1")) {
-        console.log("Skipping non-suiprivkey line (not starting with suiprivkey1)");
+        console.log(
+          "Skipping non-suiprivkey line (not starting with suiprivkey1)"
+        );
         continue;
       }
-
       try {
         const kp = keypairFromBech32PrivateKey(line);
         const address = kp.getPublicKey().toSuiAddress();
-
-        // jalankan loop request sampai berhasil lalu lanjut ke next key
-        const res = await requestUntilSuccess(address);
-        // apabila butuh catatan sukses/gagal kita bisa tulis ke file, tapi user minta minimal.
-        // lanjut ke akun berikutnya
+        addresses.push(address);
       } catch (e) {
-        console.error("Failed to derive address from a private key line:", e?.message || e);
-        // continue to next line
+        console.error(
+          "Failed to derive address from a private key line:",
+          e?.message || e
+        );
       }
     }
 
-    console.log("All keys processed.");
+    if (addresses.length === 0) {
+      console.error("Tidak ada address valid dari privatekey.txt.");
+      process.exit(1);
+    }
+
+    console.log(`Total derived addresses: ${addresses.length}`);
+
+    // 1 jam per address by default
+    const ONE_HOUR_MS = 60 * 60 * 1000;
+
+    const results = [];
+    for (const addr of addresses) {
+      console.log(
+        `\n>>> Processing address (daily target: 1 faucet success): ${addr}`
+      );
+      const ok = await requestUntilOneSuccess(addr, ONE_HOUR_MS);
+      results.push({ address: addr, success: ok });
+    }
+
+    // Cari address yang BELUM sukses di run ini
+    const failed = results.filter((r) => !r.success);
+
+    if (failed.length === 0) {
+      console.log("Semua address dapat minimal 1x faucet success hari ini. 🎉");
+      process.exit(0);
+    }
+
+    if (failed.length === 1) {
+      const addr = failed[0].address;
+      console.log(
+        `🔥 Only ONE address without success in this run (${addr}) → will spam WITHOUT time limit until success.`
+      );
+      await requestUntilOneSuccess(addr, null);
+    } else {
+      console.log(
+        `There are ${failed.length} addresses without success in this run. They will be retried on the next day's run.`
+      );
+    }
+
+    console.log("Run finished.");
     process.exit(0);
   } catch (e) {
     console.error("Fatal error:", e?.message || e);
